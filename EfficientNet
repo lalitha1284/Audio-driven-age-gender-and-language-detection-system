@@ -1,0 +1,455 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import joblib
+import os
+
+# ==== CONFIG ====
+EXCEL_PATH = '/kaggle/input/audio-prediction-dataset/excel_spectrogram1.xlsx'
+BATCH_SIZE = 32
+EPOCHS = 25
+LEARNING_RATE = 1e-4
+PATIENCE = 5
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==== LOAD AND ENCODE DATA ====
+df = pd.read_excel(EXCEL_PATH).dropna()
+
+encoders = {}
+for col in ['age', 'gender', 'accent']:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col])
+    encoders[col] = le
+    joblib.dump(le, f"{col}_encoder.pkl")
+
+train_df, val_df = train_test_split(
+    df, test_size=0.2, random_state=42, stratify=df['accent']
+)
+
+# ==== DATASET CLASS ====
+class AudioDataset(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = Image.open(row['filename_spectrogram']).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        age = int(row['age'])
+        gender = int(row['gender'])
+        accent = int(row['accent'])
+        label = torch.tensor([age, gender, accent], dtype=torch.long)
+        return image, label
+
+# ==== TRANSFORMS ====
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# ==== DATA LOADERS ====
+train_dataset = AudioDataset(train_df, transform=transform)
+val_dataset = AudioDataset(val_df, transform=transform)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# ==== EFFICIENTNET MODEL ====
+class MultiOutputEfficientNet(nn.Module):
+    def __init__(self, num_age, num_gender, num_accent):
+        super(MultiOutputEfficientNet, self).__init__()
+        self.base_model = models.efficientnet_b0(weights='IMAGENET1K_V1')
+        in_features = self.base_model.classifier[1].in_features
+        self.base_model.classifier = nn.Identity()
+
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc_age = nn.Linear(in_features, num_age)
+        self.fc_gender = nn.Linear(in_features, num_gender)
+        self.fc_accent = nn.Linear(in_features, num_accent)
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = self.dropout(x)
+        return self.fc_age(x), self.fc_gender(x), self.fc_accent(x)
+
+model = MultiOutputEfficientNet(
+    num_age=len(encoders['age'].classes_),
+    num_gender=len(encoders['gender'].classes_),
+    num_accent=len(encoders['accent'].classes_)
+).to(DEVICE)
+
+# ==== LOSS FUNCTIONS ====
+criterion_age = nn.CrossEntropyLoss()
+criterion_gender = nn.CrossEntropyLoss()
+criterion_accent = nn.CrossEntropyLoss()
+
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.5, verbose=True)
+
+# ==== TRAINING LOOP ====
+train_losses, val_losses = [], []
+train_accuracies, val_accuracies = [], []
+best_val_acc = 0
+patience_counter = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss = 0
+    correct_age = correct_gender = correct_accent = total = 0
+
+    for X, y in train_loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+
+        out_age, out_gender, out_accent = model(X)
+
+        loss_age = criterion_age(out_age, y[:, 0])
+        loss_gender = criterion_gender(out_gender, y[:, 1])
+        loss_accent = criterion_accent(out_accent, y[:, 2])
+
+        loss = loss_age + loss_gender + loss_accent
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        correct_age += (out_age.argmax(1) == y[:, 0]).sum().item()
+        correct_gender += (out_gender.argmax(1) == y[:, 1]).sum().item()
+        correct_accent += (out_accent.argmax(1) == y[:, 2]).sum().item()
+        total += y.size(0)
+
+    avg_train_acc = (correct_age + correct_gender + correct_accent) / (3 * total)
+    train_losses.append(train_loss / len(train_loader))
+    train_accuracies.append(avg_train_acc)
+    print(f"Epoch {epoch+1} - Loss: {train_losses[-1]:.4f} | Train Acc: {avg_train_acc:.4f}")
+
+    # ==== VALIDATION ====
+    model.eval()
+    val_loss = 0
+    val_correct_age = val_correct_gender = val_correct_accent = val_total = 0
+    with torch.no_grad():
+        for X, y in val_loader:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            out_age, out_gender, out_accent = model(X)
+
+            loss_age = criterion_age(out_age, y[:, 0])
+            loss_gender = criterion_gender(out_gender, y[:, 1])
+            loss_accent = criterion_accent(out_accent, y[:, 2])
+
+            val_loss += loss_age.item() + loss_gender.item() + loss_accent.item()
+            val_correct_age += (out_age.argmax(1) == y[:, 0]).sum().item()
+            val_correct_gender += (out_gender.argmax(1) == y[:, 1]).sum().item()
+            val_correct_accent += (out_accent.argmax(1) == y[:, 2]).sum().item()
+            val_total += y.size(0)
+
+    avg_val_acc = (val_correct_age + val_correct_gender + val_correct_accent) / (3 * val_total)
+    val_losses.append(val_loss / len(val_loader))
+    val_accuracies.append(avg_val_acc)
+    print(f"Validation Accuracy: {avg_val_acc:.4f}")
+
+    scheduler.step(avg_val_acc)
+
+    if avg_val_acc > best_val_acc:
+        best_val_acc = avg_val_acc
+        torch.save(model.state_dict(), "efficientnet_audio_best_model1501.pth")
+        patience_counter = 0
+        print("✅ Model saved with improved validation accuracy.")
+    else:
+        patience_counter += 1
+        if patience_counter >= PATIENCE:
+            print("⏹ Early stopping triggered.")
+            break
+
+# ==== SAVE FINAL MODEL ====
+torch.save(model.state_dict(), "efficientnet_audio_final_model1501.pth")
+
+
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+from torchvision.models import EfficientNet_B0_Weights
+from PIL import Image
+import torch.nn as nn
+import pandas as pd
+import joblib
+import os
+
+# ==== CONFIG ====
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EXCEL_PATH = '/kaggle/input/audio-prediction-dataset/excel_spectrogram1.xlsx'
+
+# ==== LOAD ENCODERS ====
+age_encoder = joblib.load("age_encoder.pkl")
+gender_encoder = joblib.load("gender_encoder.pkl")
+accent_encoder = joblib.load("accent_encoder.pkl")
+
+# ==== LOAD DATAFRAME & ENCODE LABELS ====
+df = pd.read_excel(EXCEL_PATH).dropna()
+
+# Encode only if values are in string format
+if df['age'].dtype == 'object':
+    df['age'] = age_encoder.transform(df['age'])
+if df['gender'].dtype == 'object':
+    df['gender'] = gender_encoder.transform(df['gender'])
+if df['accent'].dtype == 'object':
+    df['accent'] = accent_encoder.transform(df['accent'])
+
+# Split validation data
+val_df = df.sample(frac=0.2, random_state=42).reset_index(drop=True)
+
+# ==== IMAGE TRANSFORMS ====
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# ==== DATASET ====
+class AudioDataset(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = row['filename_spectrogram']
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        label = torch.tensor([
+            int(row['age']),
+            int(row['gender']),
+            int(row['accent'])
+        ], dtype=torch.long)
+        return image, label
+
+val_dataset = AudioDataset(val_df, transform=transform)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# ==== MODEL ====
+class MultiOutputEfficientNet(nn.Module):
+    def __init__(self, num_age, num_gender, num_accent):
+        super(MultiOutputEfficientNet, self).__init__()
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+        self.base_model = models.efficientnet_b0(weights=weights)
+        in_features = self.base_model.classifier[1].in_features
+        self.base_model.classifier = nn.Identity()
+        
+        self.dropout = nn.Dropout(p=0.4)
+        self.fc_age = nn.Linear(in_features, num_age)
+        self.fc_gender = nn.Linear(in_features, num_gender)
+        self.fc_accent = nn.Linear(in_features, num_accent)
+
+    def forward(self, x):
+        x = self.base_model(x)
+        x = self.dropout(x)
+        return self.fc_age(x), self.fc_gender(x), self.fc_accent(x)
+
+model = MultiOutputEfficientNet(
+    num_age=len(age_encoder.classes_),
+    num_gender=len(gender_encoder.classes_),
+    num_accent=len(accent_encoder.classes_)
+)
+
+# ==== LOAD MODEL ====
+model.load_state_dict(torch.load("efficientnet_audio_best_model1501.pth", map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+# ==== EVALUATE ====
+correct_age = correct_gender = correct_accent = total = 0
+
+with torch.no_grad():
+    for X, y in val_loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        out_age, out_gender, out_accent = model(X)
+
+        pred_age = out_age.argmax(1)
+        pred_gender = out_gender.argmax(1)
+        pred_accent = out_accent.argmax(1)
+
+        correct_age += (pred_age == y[:, 0]).sum().item()
+        correct_gender += (pred_gender == y[:, 1]).sum().item()
+        correct_accent += (pred_accent == y[:, 2]).sum().item()
+        total += y.size(0)
+
+# ==== PRINT ACCURACY ====
+acc_age = correct_age / total
+acc_gender = correct_gender / total
+acc_accent = correct_accent / total
+overall_accuracy = (correct_age + correct_gender + correct_accent) / (3 * total)
+
+print(f"✅ Test Accuracy (Age):    {acc_age:.4f}")
+print(f"✅ Test Accuracy (Gender): {acc_gender:.4f}")
+print(f"✅ Test Accuracy (Accent): {acc_accent:.4f}")
+print(f"🎯 Overall Test Accuracy:  {overall_accuracy:.4f}")
+
+
+
+
+import torch
+import torchvision.transforms as transforms
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from PIL import Image
+import matplotlib.pyplot as plt
+import librosa
+import librosa.display
+import numpy as np
+import joblib
+import os
+import torch.nn as nn
+
+# Load encoders
+age_encoder = joblib.load("age_encoder.pkl")
+gender_encoder = joblib.load("gender_encoder.pkl")
+accent_encoder = joblib.load("accent_encoder.pkl")
+
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Image transform (same as training)
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# --- Define the EfficientNet-based Multi-output Model ---
+class MultiOutputEfficientNet(nn.Module):
+    def __init__(self, num_age, num_gender, num_accent):
+        super(MultiOutputEfficientNet, self).__init__()
+        weights = EfficientNet_B0_Weights.DEFAULT
+        self.base_model = efficientnet_b0(weights=weights)
+        in_features = self.base_model.classifier[1].in_features
+        self.base_model.classifier = nn.Identity()
+
+        # These names match the saved model: fc_age, fc_gender, fc_accent
+        self.fc_age = nn.Linear(in_features, num_age)
+        self.fc_gender = nn.Linear(in_features, num_gender)
+        self.fc_accent = nn.Linear(in_features, num_accent)
+
+    def forward(self, x):
+        x = self.base_model(x)
+        return self.fc_age(x), self.fc_gender(x), self.fc_accent(x)
+
+# Load the trained EfficientNet model
+model = MultiOutputEfficientNet(
+    num_age=len(age_encoder.classes_),
+    num_gender=len(gender_encoder.classes_),
+    num_accent=len(accent_encoder.classes_)
+)
+model.load_state_dict(torch.load("efficientnet_audio_best_model1501.pth", map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+# --- Convert audio to spectrogram image ---
+def audio_to_spectrogram_image(audio_path, output_path="temp_spec.png"):
+    y, sr = librosa.load(audio_path, sr=22050)
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+    S_DB = librosa.power_to_db(S, ref=np.max)
+
+    plt.figure(figsize=(3, 3))
+    librosa.display.specshow(S_DB, sr=sr, x_axis='time', y_axis='mel')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    return output_path
+
+# --- Prediction function ---
+def predict_audio_file(audio_path):
+    # Convert audio to spectrogram image
+    image_path = audio_to_spectrogram_image(audio_path)
+
+    # Load and transform image
+    image = Image.open(image_path).convert("RGB")
+    image = transform(image).unsqueeze(0).to(DEVICE)
+
+    # Predict
+    with torch.no_grad():
+        out_age, out_gender, out_accent = model(image)
+        pred_age = age_encoder.inverse_transform(out_age.argmax(1).cpu().numpy())[0]
+        pred_gender = gender_encoder.inverse_transform(out_gender.argmax(1).cpu().numpy())[0]
+        pred_accent = accent_encoder.inverse_transform(out_accent.argmax(1).cpu().numpy())[0]
+
+    print(f"🎤 Predicted Age Group: {pred_age}")
+    print(f"🎤 Predicted Gender:    {pred_gender}")
+    print(f"🎤 Predicted Accent:    {pred_accent}")
+
+    # Remove temp image
+    if os.path.exists(image_path):
+        os.remove(image_path)
+
+# Example prediction
+predict_audio_file("/kaggle/input/sample-audio/This fisherman got the best voicemail ever. .mp3")
+
+from sklearn.metrics import classification_report
+import numpy as np
+
+# Store all true and predicted labels
+true_age, pred_age_all = [], []
+true_gender, pred_gender_all = [], []
+true_accent, pred_accent_all = [], []
+
+# Collect predictions from the validation set
+with torch.no_grad():
+    for X, y in val_loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        out_age, out_gender, out_accent = model(X)
+
+        pred_age = out_age.argmax(1)
+        pred_gender = out_gender.argmax(1)
+        pred_accent = out_accent.argmax(1)
+
+        true_age.extend(y[:, 0].cpu().numpy())
+        pred_age_all.extend(pred_age.cpu().numpy())
+
+        true_gender.extend(y[:, 1].cpu().numpy())
+        pred_gender_all.extend(pred_gender.cpu().numpy())
+
+        true_accent.extend(y[:, 2].cpu().numpy())
+        pred_accent_all.extend(pred_accent.cpu().numpy())
+
+# === Generate Classification Reports (Weighted) ===
+age_report = classification_report(true_age, pred_age_all, output_dict=True, zero_division=0)
+gender_report = classification_report(true_gender, pred_gender_all, output_dict=True, zero_division=0)
+accent_report = classification_report(true_accent, pred_accent_all, output_dict=True, zero_division=0)
+
+# === Extract Weighted Avg Metrics ===
+weighted_precision = np.mean([
+    age_report['weighted avg']['precision'],
+    gender_report['weighted avg']['precision'],
+    accent_report['weighted avg']['precision']
+])
+
+weighted_recall = np.mean([
+    age_report['weighted avg']['recall'],
+    gender_report['weighted avg']['recall'],
+    accent_report['weighted avg']['recall']
+])
+
+weighted_f1 = np.mean([
+    age_report['weighted avg']['f1-score'],
+    gender_report['weighted avg']['f1-score'],
+    accent_report['weighted avg']['f1-score']
+])
+
+# === Print Overall Weighted Averages ===
+print("\n📊 Classification Scores:")
+print(f"🔹 Precision: {weighted_precision:.4f}")
+print(f"🔹 Recall:    {weighted_recall:.4f}")
+print(f"🔹 F1-Score:  {weighted_f1:.4f}")
